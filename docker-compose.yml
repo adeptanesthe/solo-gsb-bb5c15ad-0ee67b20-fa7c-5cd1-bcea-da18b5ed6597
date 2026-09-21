@@ -1,0 +1,52 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dropbox
+      POSTGRES_PASSWORD: dropbox
+      POSTGRES_DB: dropbox
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dropbox -d dropbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    # 仅集群内部可达，不对宿主机暴露
+    expose:
+      - "5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # 关闭 RDB/AOF：只缓存可丢失的终态标记，重启后自动回落数据库判定
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    expose:
+      - "6379"
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://dropbox:dropbox@db:5432/dropbox
+      REDIS_URL: redis://redis:6379/0
+      MAX_CONTENT_BYTES: "1048576"
+      TTL_MIN_SECONDS: "60"
+      TTL_MAX_SECONDS: "604800"
+    ports:
+      # 宿主机 8000 -> 容器 8000
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
