@@ -12,19 +12,37 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import redis.exceptions
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import JSONResponse, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .audit_chain import (
+    GENESIS_HASH,
+    ChainEntry,
+    ChainFormatError,
+    dumps_ndjson,
+    verify_chain,
+)
 from .config import Settings, get_settings
 from .db import Database
 from .models import Delivery
 from .redis_client import DenyCache, create_redis
 from .schemas import (
+    AuditVerifyResponse,
     CreateResponse,
     CreateTextRequest,
     DenyResponse,
@@ -483,6 +501,179 @@ async def revoke(
     return _deny(UNKNOWN)
 
 
+# ---------------- 审计：哈希链导出 / 校验 ----------------
+
+
+def _validate_range(start, end) -> None:
+    if start is not None and end is not None and start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start 必须早于 end（时间范围为左闭右开）",
+        )
+
+
+@app.get(
+    "/api/v1/audit/export",
+    tags=["audit"],
+    summary="按时间范围导出审计链记录（NDJSON，只读）",
+    responses={
+        200: {
+            "description": (
+                "每行一条链记录（application/x-ndjson）。响应头返回起止链哈希与"
+                "记录数：X-Chain-Start-Hash / X-Chain-End-Hash / "
+                "X-Chain-Record-Count / X-Chain-Genesis-Hash。"
+            )
+        },
+        422: {"description": "时间范围非法"},
+    },
+)
+async def export_audit(
+    request: Request,
+    start: datetime | None = Query(
+        default=None, description="起始时间（含），ISO-8601，例如 2026-09-21T00:00:00Z"
+    ),
+    end: datetime | None = Query(
+        default=None, description="结束时间（不含），ISO-8601"
+    ),
+):
+    """流式导出时间范围内的审计链记录。
+
+    - 只读：PostgreSQL 上以 READ ONLY + REPEATABLE READ 事务读取，
+      计数/边界/流内容来自同一快照，且驱动层拒绝任何写操作；
+    - 仅含审计字段与链哈希，**绝不包含投递明文内容**。
+    """
+    _validate_range(start, end)
+    db: Database = request.app.state.db
+
+    # 独立 session：其生命周期跨越流式响应（在生成器结束时关闭）
+    session_cm = db.session_factory()
+    session = await session_cm.__aenter__()
+    try:
+        conn = await session.connection()
+        if conn.dialect.name == "postgresql":
+            # 整个导出共享同一快照，且驱动层强制只读
+            await conn.exec_driver_sql(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+
+        audit_store = DeliveryStore(session)
+        count, first, last = await audit_store.audit_range_meta(start=start, end=end)
+
+        async def _stream():
+            try:
+                async for entry in audit_store.iter_audit_range(start=start, end=end):
+                    yield dumps_ndjson(entry)
+            finally:
+                await session_cm.__aexit__(None, None, None)
+
+        headers = {
+            "Content-Type": "application/x-ndjson; charset=utf-8",
+            "Content-Disposition": 'attachment; filename="audit-export.ndjson"',
+            "X-Chain-Genesis-Hash": GENESIS_HASH,
+            "X-Chain-Start-Hash": first.entry_hash if first else "",
+            "X-Chain-End-Hash": last.entry_hash if last else "",
+            "X-Chain-Record-Count": str(count),
+        }
+        return StreamingResponse(_stream(), status_code=200, headers=headers)
+    except BaseException:
+        await session_cm.__aexit__(None, None, None)
+        raise
+
+
+@app.get(
+    "/api/v1/audit/verify",
+    response_model=AuditVerifyResponse,
+    tags=["audit"],
+    summary="校验库内审计链完整性（缺行/乱序/重复/改写/断裂）",
+)
+async def verify_audit_db(
+    start: datetime | None = Query(default=None, description="起始时间（含），ISO-8601"),
+    end: datetime | None = Query(default=None, description="结束时间（不含），ISO-8601"),
+    session: AsyncSession = Depends(get_db),
+) -> AuditVerifyResponse:
+    """全链（不带时间参数）或时间范围片段校验，返回第一处错误。
+
+    全链校验从创世哈希锚定；片段校验自动以库中该片段首条的前一条记录
+    作为链锚。只读，不产生新审计记录。
+    """
+    _validate_range(start, end)
+    store = DeliveryStore(session)
+    entries = [e async for e in store.iter_audit_range(start=start, end=end)]
+
+    if not entries:
+        return AuditVerifyResponse(ok=True)
+
+    if start is None and end is None:
+        expected_seq, anchor = 1, GENESIS_HASH
+    else:
+        expected_seq = entries[0].seq
+        anchor = await store.entry_hash_before(expected_seq)
+
+    report = verify_chain(entries, expected_seq=expected_seq, anchor_hash=anchor)
+    return AuditVerifyResponse(**report.__dict__)
+
+
+@app.post(
+    "/api/v1/audit/verify",
+    response_model=AuditVerifyResponse,
+    tags=["audit"],
+    summary="校验一份导出的 NDJSON 审计链（上传内容本身不入库）",
+    responses={400: {"description": "NDJSON 格式非法"}, 413: {"description": "上传过大"}},
+)
+async def verify_audit_upload(
+    request: Request,
+    anchor_hash: str | None = Query(
+        default=None,
+        description="首条记录前一条的链哈希；首条为序号 1 时自动使用创世哈希",
+    ),
+) -> AuditVerifyResponse:
+    """上传导出的 NDJSON 内容，按其 *行顺序* 校验，可检出乱序。
+
+    与 GET 版的区别：GET 总是按库内 seq 排序，无法发现顺序颠倒；
+    本接口按提交的行顺序逐行校验，因此能检出导出/传输过程中的乱序。
+    """
+    import json
+
+    raw = await request.body()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="校验上传内容超过 10 MiB 上限",
+        )
+
+    entries = []
+    try:
+        text_body = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请求体不是合法 UTF-8 文本",
+        ) from exc
+
+    for position, line in enumerate(text_body.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"第 {position} 行不是合法 JSON：{exc.msg}",
+            ) from exc
+        try:
+            entries.append(ChainEntry.from_dict(obj, position=position))
+        except ChainFormatError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+
+    if not entries:
+        return AuditVerifyResponse(ok=True)
+
+    report = verify_chain(entries, anchor_hash=anchor_hash)
+    return AuditVerifyResponse(**report.__dict__)
+
+
 # ---------------- 健康检查 ----------------
 
 
@@ -517,6 +708,9 @@ async def root() -> dict:
             "POST /api/v1/deliveries/file",
             "POST /api/v1/pickup/{token}",
             "POST /api/v1/revoke/{token}",
+            "GET  /api/v1/audit/export",
+            "GET  /api/v1/audit/verify",
+            "POST /api/v1/audit/verify",
             "GET  /health",
         ],
     }

@@ -50,3 +50,19 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     redis: str
+
+
+class AuditVerifyResponse(BaseModel):
+    """哈希链完整性校验报告；ok=False 时 error 指出第一处错误类型。"""
+
+    ok: bool
+    count: int = Field(default=0, description="实际校验的记录数")
+    first_seq: int | None = Field(default=None, description="首条记录序号")
+    last_seq: int | None = Field(default=None, description="末条记录序号")
+    start_hash: str | None = Field(default=None, description="首条记录的链哈希")
+    end_hash: str | None = Field(default=None, description="末条记录的链哈希")
+    # missing | out_of_order | duplicate | field_tampered | chain_break
+    error: str | None = Field(default=None, description="第一处错误的类型")
+    seq: int | None = Field(default=None, description="第一处错误所在记录序号")
+    position: int | None = Field(default=None, description="第一处错误所在行（从 1 开始）")
+    detail: str | None = Field(default=None, description="中文错误说明")

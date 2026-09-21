@@ -10,9 +10,12 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy import insert, select
 
+from .audit_chain import GENESIS_HASH
 from .config import settings
-from .models import Base
+from .models import AuditChainState, Base
+from .utils import utcnow
 
 
 class Database:
@@ -62,6 +65,20 @@ class Database:
         # 直接 create_all：表结构简单，避免引入迁移工具
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # 种子化哈希链游标（空链：last_seq=0，last_hash=创世哈希）
+            state_table = AuditChainState.__table__
+            exists = await conn.scalar(
+                select(state_table.c.id).where(state_table.c.id == 1)
+            )
+            if exists is None:
+                await conn.execute(
+                    insert(state_table).values(
+                        id=1,
+                        last_seq=0,
+                        last_hash=GENESIS_HASH,
+                        updated_at=utcnow(),
+                    )
+                )
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.session_factory() as session:

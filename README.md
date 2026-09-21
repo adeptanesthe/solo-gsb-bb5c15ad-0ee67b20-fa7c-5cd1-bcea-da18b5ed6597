@@ -47,6 +47,9 @@ docker compose down -v
 | `POST` | `/api/v1/deliveries/file` | 创建小文件投递（multipart/form-data） |
 | `POST` | `/api/v1/pickup/{token}` | 凭令牌取件（**只能成功一次**） |
 | `POST` | `/api/v1/revoke/{token}` | 发送者撤回投递 |
+| `GET` | `/api/v1/audit/export` | 按时间范围导出审计链记录（**NDJSON 流**，只读） |
+| `GET` | `/api/v1/audit/verify` | 校验库内审计链完整性（只读） |
+| `POST` | `/api/v1/audit/verify` | 校验一份导出的 NDJSON（按行顺序，可发现乱序） |
 | `GET` | `/health` | 健康检查 |
 
 ### 取件/撤回的明确结果
@@ -177,23 +180,115 @@ RETURNING id, content, …;
 
 ---
 
-## 审计（最小留痕）
+## 审计与可验证完整性（哈希链）
 
-所有关键动作写入 `audit_logs` 表：
+所有关键动作写入 `audit_logs` 表，并且**每一条新日志（包括未知令牌等失败
+请求）都在同一个 PostgreSQL 事务中加入一条只增哈希链**：
 
 - 动作：`create` / `pickup` / `revoke`
 - 结果：`success` / `consumed` / `revoked` / `expired` / `unknown`
 - 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情
-- **未知令牌的尝试也留痕**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
+- **未知令牌的尝试也留痕并入链**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
 
-明文内容不写入审计。
+明文内容不写入审计，也不会出现在任何导出/校验数据中。
+
+### 每条记录的链字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `seq` | 全链单调递增序号（从 1 开始，唯一约束兜底） |
+| `event_digest` | 规范化事件摘要的 SHA-256 |
+| `prev_hash` | 前一条记录的链哈希；序号 1 的 `prev_hash` 为固定创世哈希 |
+| `entry_hash` | 本条链哈希：`SHA256(prev_hash ‖ "|" ‖ event_digest)` |
+
+**规范化事件摘要**对业务字段（格式版本、序号、UTC 微秒时间、动作、结果、
+`delivery_id`、`token_hash`、IP、UA、详情）做确定性序列化：UTF-8、键排序、
+紧凑 JSON，再取 SHA-256。因此任一字段被改写，摘要都会失配。
+
+> 链只能阻止“非重算式”篡改。拥有数据库写权限的攻击者若从某点起重算全部
+> 后续哈希，表面校验仍可通过——因此**导出接口返回的 `X-Chain-End-Hash`
+> 应由外部独立留存**（如每次导出后另行存档），作为日后校验的信任锚。
+
+### 并发写入：链序由数据库裁决
+
+链游标是 `audit_chain_state` 表中的单行 `(last_seq, last_hash)`。追加一条
+审计时，在请求所在事务内：
+
+1. 读取当前游标，计算新序号/摘要/链哈希；
+2. **先**执行条件更新抢占游标：
+   `UPDATE audit_chain_state SET last_seq=new, last_hash=… WHERE id=1 AND last_seq=:read`；
+3. 仅当更新命中（`rowcount=1`）才插入审计行并提交；未命中说明他人已推进
+   游标，本事务没有产生任何写入，重读游标后重试。
+
+这与原子消费使用完全相同的裁决模式：PostgreSQL（READ COMMITTED）用行锁
+把对游标单行的更新串行化，竞争事务的 `WHERE` 在锁释放后按最新行版本重新
+判定，只有一个事务命中。链的全序因此由数据库裁决，不依赖应用层锁。
+
+### 导出 NDJSON（只读）
+
+```bash
+# 全量导出（左闭右开时间范围，两个参数均可省略）
+curl -s -D headers.txt -o audit.ndjson \
+  "http://localhost:8000/api/v1/audit/export?start=2026-09-21T00:00:00Z&end=2026-09-22T00:00:00Z"
+
+cat headers.txt | grep -i x-chain
+# X-Chain-Genesis-Hash: <64 位十六进制>
+# X-Chain-Start-Hash:   <范围内第一条记录的链哈希，空范围为空>
+# X-Chain-End-Hash:     <范围内最后一条记录的链哈希，空范围为空>
+# X-Chain-Record-Count: <记录数>
+```
+
+- 每行一条记录（`application/x-ndjson`），字段仅为审计元数据 + 链哈希，
+  **不含投递明文内容**；
+- 计数、起止哈希与流内容在同一个 **READ ONLY + REPEATABLE READ** 事务中
+  取得，共享同一快照（驱动层拒绝任何写操作）；
+- 建议每次导出后把响应头中的 `X-Chain-End-Hash` 与记录数独立存档。
+
+导出的 NDJSON 长这样（一行）：
+
+```json
+{"action":"create","client_ip":null,"created_at":"2026-09-21T09:05:11.123456Z","delivery_id":"8f1c…","detail":{"kind":"text","size":30,"ttl_seconds":3600},"entry_hash":"…","event_digest":"…","prev_hash":"…","result":"success","seq":1,"token_hash":"…","user_agent":null}
+```
+
+### 校验：五类问题，指出第一处
+
+```bash
+# 校验库内全链（GET 版按库内 seq 顺序；只读，不产生新审计记录）
+curl -s http://localhost:8000/api/v1/audit/verify
+# {"ok":true,"count":12,"first_seq":1,"last_seq":12,"start_hash":"…","end_hash":"…",
+#  "error":null,"seq":null,"position":null,"detail":null}
+
+# 校验一份导出文件（POST 版严格按上传行顺序，可发现乱序）
+curl -s -X POST --data-binary @audit.ndjson \
+  -H 'Content-Type: application/x-ndjson' \
+  http://localhost:8000/api/v1/audit/verify
+```
+
+`ok=false` 时按检查顺序返回**第一处**错误，`error` 取值：
+
+| `error` | 含义 | `seq` / `position` |
+| --- | --- | --- |
+| `duplicate` | 同一序号重复出现 | 重复序号 / 所在行 |
+| `out_of_order` | 记录乱序（序号回退或提前） | 越界序号 / 所在行 |
+| `missing` | 缺行（序号跳号且期望序号未在后续出现） | 缺失序号 / 发现位置 |
+| `field_tampered` | 规范化摘要不匹配，字段被改写 | 被改记录序号 / 所在行 |
+| `chain_break` | 链哈希或前指针不匹配 | 断裂处序号 / 所在行 |
+
+- `GET` 全链校验从创世哈希锚定；带时间范围时自动以库中该片段首条的前一条
+  记录作为锚点（片段之前缺行不在该范围校验内，请用全链校验获得权威结论）。
+- `POST` 校验以序号 1 开头时自动锚定创世哈希；校验任意片段时可通过
+  `?anchor_hash=<前一条链哈希>` 显式提供信任锚（通常取自导出响应头）。
+- 上传内容仅用于重算校验，**不会入库**；请求体上限 10 MiB。
 
 ### 数据模型要点
 
 - 令牌为 32 字节 `secrets.token_urlsafe(32)`，库中仅存其 **SHA-256**；
 - 内容存 PostgreSQL `bytea`，同时记录大小与 SHA-256；
 - 状态机：`active → consumed | revoked | expired`，单向不可逆；
-- `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫。
+- `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫；
+- `audit_logs` 额外保存 `seq / event_digest / prev_hash / entry_hash`
+  （链字段），链游标存于单行表 `audit_chain_state`，表结构在启动时
+  自动创建并种子化创世游标。
 
 ---
 
@@ -224,7 +319,9 @@ pytest
 
 测试套件使用文件型 SQLite（WAL，多连接真实争抢写锁）+ `fakeredis`，
 包含 **50 路并发取件仅有一个赢家**、**取件/撤回并发互斥**、撤回、过期、
-文件一次性下载、未知令牌与审计留痕等用例。另在真实 PostgreSQL 上验证过
+文件一次性下载、未知令牌与审计留痕，以及**哈希链入链/导出 NDJSON/五类
+篡改检测（缺行、乱序、重复、字段改写、链断裂并指出第一处）/40 路并发
+写入序号严格连续/链游标竞态失配重试**等用例。另在真实 PostgreSQL 上验证过
 100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
 
 ---
