@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .audit_api import router as audit_router
 from .config import Settings, get_settings
 from .db import Database
 from .models import Delivery
@@ -122,6 +123,7 @@ app = FastAPI(
     description="创建带过期时间的文本/小文件投递，取件令牌只能成功读取一次。",
     lifespan=lifespan,
 )
+app.include_router(audit_router)
 
 
 # ---------------- 辅助 ----------------
@@ -517,6 +519,9 @@ async def root() -> dict:
             "POST /api/v1/deliveries/file",
             "POST /api/v1/pickup/{token}",
             "POST /api/v1/revoke/{token}",
+            "GET  /api/v1/audit/export",
+            "GET  /api/v1/audit/verify",
+            "POST /api/v1/audit/verify",
             "GET  /health",
         ],
     }

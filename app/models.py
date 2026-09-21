@@ -8,7 +8,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, LargeBinary, String, text
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    LargeBinary,
+    String,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import CHAR, JSON, TypeDecorator
@@ -99,6 +108,30 @@ class AuditLog(Base):
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, index=True
+    )
+
+    # ---- 哈希链完整性字段（见 app/chain.py）----
+    # 链序号，从 1 开始连续递增；唯一索引由数据库裁决并发追加顺序
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    # 规范化事件摘要：SHA-256(规范化的事件字段 JSON)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 前一条审计记录的链哈希；第 1 条为 64 个 0（GENESIS_HASH）
+    prev_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 本条链哈希：SHA-256(prev_hash + seq + event_hash)
+    entry_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class AuditChainState(Base):
+    """审计链链尖：单行表（固定 id=1），并发追加时由条件 UPDATE 裁决顺序。"""
+
+    __tablename__ = "audit_chain_state"
+
+    # 固定为 1，全表只允许一行
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    last_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
 
 

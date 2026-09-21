@@ -47,6 +47,9 @@ docker compose down -v
 | `POST` | `/api/v1/deliveries/file` | 创建小文件投递（multipart/form-data） |
 | `POST` | `/api/v1/pickup/{token}` | 凭令牌取件（**只能成功一次**） |
 | `POST` | `/api/v1/revoke/{token}` | 发送者撤回投递 |
+| `GET` | `/api/v1/audit/export` | 按时间范围导出审计链（**NDJSON 只读流**） |
+| `GET` | `/api/v1/audit/verify` | 在线校验库内整条审计哈希链 |
+| `POST` | `/api/v1/audit/verify` | 校验此前导出的 NDJSON 审计文件 |
 | `GET` | `/health` | 健康检查 |
 
 ### 取件/撤回的明确结果
@@ -177,23 +180,116 @@ RETURNING id, content, …;
 
 ---
 
-## 审计（最小留痕）
+## 审计：可验证完整性的哈希链
 
 所有关键动作写入 `audit_logs` 表：
 
 - 动作：`create` / `pickup` / `revoke`
 - 结果：`success` / `consumed` / `revoked` / `expired` / `unknown`
 - 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情
-- **未知令牌的尝试也留痕**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
+- **未知令牌的尝试也留痕并入链**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
 
-明文内容不写入审计。
+明文内容不写入审计；导出接口同样只输出审计列，**绝不包含投递明文**（`text` /
+文件字节 / 文件名以外的内容字段均不出现；详情里只有类型、大小、文件名等元数据）。
+
+### 每条日志的三级结构
+
+每条审计记录除业务字段外，还带链字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `seq` | 链序号，从 1 开始连续递增，数据库唯一索引 |
+| `event_hash` | **规范化事件摘要**：`SHA-256("dropbox-audit-event-v1\n" + 规范化事件 JSON)` |
+| `prev_hash` | **前一条摘要哈希**（上一条的 `entry_hash`）；第 1 条为 64 个 `0`（创世哈希） |
+| `entry_hash` | **本条链哈希**：`SHA-256("dropbox-audit-entry-v1\n" + prev_hash + "\n" + seq + "\n" + event_hash)` |
+
+规范化事件 JSON 固定包含 `v / id / delivery_id / token_hash / action / result /
+detail / client_ip / user_agent / created_at`，按键名排序、无多余空白、不转义
+非 ASCII；`created_at` 统一为 UTC 微秒精度、`Z` 结尾的 ISO-8601。任何字段被改写
+都会使 `event_hash` 对不上；任何删除、重排、重放或前链篡改都会使链链接对不上。
+
+### 并发写入：链序由数据库条件更新裁决
+
+`audit_chain_state` 单行表保存链尖 `(last_seq, last_hash)`。写入一条审计时：
+
+1. 读取当前链尖，算出下一个 `seq = last_seq + 1` 与候选链哈希；
+2. 执行条件更新
+   `UPDATE audit_chain_state SET last_seq=:next, last_hash=:candidate
+    WHERE id=1 AND last_seq=:读到的 AND last_hash=:读到的`；
+3. 命中（影响 1 行）才插入审计行；未命中说明并发事务已推进链尖，**重读新链尖
+   并重试**。
+
+PostgreSQL 用行锁把链尖更新串行化，SQLite（测试）靠整库写锁串行化；`seq` 上的
+唯一索引作为最终兜底。审计行与投递状态变更在**同一个数据库事务**中提交（取件
+赢家的 `UPDATE deliveries` 与审计插入原子可见），因此不会出现“消费成功但未入链”
+或“链推进成功但无审计行”。
+
+### 导出 NDJSON（只读）
+
+```bash
+curl -s "http://localhost:8000/api/v1/audit/export?start=2026-09-21T00:00:00Z&end=2026-09-22T00:00:00Z&limit=10000" \
+  -D headers.txt -o audit.ndjson
+```
+
+- 时间过滤为 `created_at >= start AND created_at < end`（均可选，ISO-8601）；
+  `limit` 1..100000，默认 10000。
+- 响应为 `application/x-ndjson`（每行一条记录的 JSON，按 `seq` 升序）。
+- 起止链哈希与记录数通过**响应头**返回，便于归档后离线校验：
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-Audit-Count` | 实际返回的记录数 |
+| `X-Audit-Start-Seq` / `X-Audit-End-Seq` | 首/末条链序号 |
+| `X-Audit-Start-Prev-Hash` | 首条的 `prev_hash`（片段锚点） |
+| `X-Audit-Start-Hash` / `X-Audit-End-Hash` | 首/末条链哈希 |
+| `X-Audit-Truncated` | `1` 表示命中 `limit`，时间窗内还有未导出的记录 |
+
+导出在只读事务中执行（PostgreSQL `SET TRANSACTION READ ONLY`；SQLite
+`PRAGMA query_only=ON`），头部与正文取自同一快照。
+
+### 校验
+
+在线校验库内全链（库未被整体改写时使用，比对链尖单行）：
+
+```bash
+curl -s http://localhost:8000/api/v1/audit/verify
+# {"ok":true,"count":42,"start_seq":1,"end_seq":42,"tip_seq":42,"tip_hash":"…",…}
+```
+
+离线校验导出的 NDJSON 文件（归档后随时可验）：
+
+```bash
+# 全量导出（从创世开始）
+curl -s -X POST http://localhost:8000/api/v1/audit/verify \
+  --data-binary @audit.ndjson -H 'Content-Type: application/x-ndjson'
+
+# 片段导出：用导出响应头里的起点锚点
+curl -s -X POST \
+  "http://localhost:8000/api/v1/audit/verify?start_seq=10&start_prev_hash=<X-Audit-Start-Prev-Hash>" \
+  --data-binary @segment.ndjson -H 'Content-Type: application/x-ndjson'
+```
+
+校验逐条按链顺序检查并在**第一处错误**处停止，错误码与定位信息：
+
+| `code` | 检测到的问题 | 返回的定位字段 |
+| --- | --- | --- |
+| `missing` | 缺行（`seq` 断档）/ 链尾缺失 | `seq`（当前）、`expected_seq`、`record_id` |
+| `out_of_order` | 乱序（`seq` 倒退） | `seq`、`expected_seq`、`record_id` |
+| `duplicate` | 重复（同一记录 id 或同一 `seq` 出现两次） | `seq`、`record_id` |
+| `field_tampered` | 字段改写（业务字段或链哈希字段被改） | `seq`、`record_id` |
+| `chain_broken` | 链断裂（`prev_hash` 对不上） | `seq`、`record_id` |
+| `tip_mismatch` | 链尾与数据库链尖不一致（截断/改写） | `tip_seq`、`tip_hash` |
+
+> 校验接口本身不写审计、不产生新链记录（否则会污染被校验对象）。
 
 ### 数据模型要点
 
 - 令牌为 32 字节 `secrets.token_urlsafe(32)`，库中仅存其 **SHA-256**；
 - 内容存 PostgreSQL `bytea`，同时记录大小与 SHA-256；
 - 状态机：`active → consumed | revoked | expired`，单向不可逆；
-- `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫。
+- `(status, expires_at)` 与 `token_hash` 建有索引，支撑并发判定与清扫；
+- 审计链字段 `(seq, event_hash, prev_hash, entry_hash)` 与链尖表
+  `audit_chain_state`；服务启动时自动建表，旧库会自动补列并按时间顺序回填链。
 
 ---
 
@@ -224,8 +320,10 @@ pytest
 
 测试套件使用文件型 SQLite（WAL，多连接真实争抢写锁）+ `fakeredis`，
 包含 **50 路并发取件仅有一个赢家**、**取件/撤回并发互斥**、撤回、过期、
-文件一次性下载、未知令牌与审计留痕等用例。另在真实 PostgreSQL 上验证过
-100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
+文件一次性下载、未知令牌与审计留痕等用例；审计链部分覆盖并发 40 路纯链尖竞争
+序号连续唯一、缺行/乱序/重复/字段改写/链断裂/链尖篡改的第一处错误定位、
+NDJSON 导出（只读、无明文、截断标记）与离线校验、旧库自动补列回填。另在真实
+PostgreSQL 上验证过 100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
 
 ---
 
@@ -234,5 +332,9 @@ pytest
 - 取件令牌是唯一的“能力凭证”：知道令牌即可取件，因此应通过私密渠道发送；
   库中不存明文令牌，泄露数据库无法反推取件地址。
 - 默认内容上限 1 MiB，面向“文本或小文件”；大文件投递不在设计范围内。
-- 本服务不含发送者身份认证/速率限制，生产部署建议放在鉴权网关之后并自行限流。
-- 表结构在启动时自动 `CREATE TABLE`（简单场景不引入迁移工具）。
+- 本服务不含发送者身份认证/速率限制，生产部署建议放在鉴权网关之后并自行限流；
+  `/api/v1/audit/*` 会暴露动作时间、令牌哈希与客户端信息（不含投递明文），
+  同样建议在网关层限制访问。
+- 表结构在启动时自动 `CREATE TABLE`（简单场景不引入迁移工具）；旧版
+  `audit_logs` 表会在启动时自动补齐哈希链列并按时间顺序回填，随后追加的日志
+  自动续链。
